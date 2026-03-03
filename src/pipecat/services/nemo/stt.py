@@ -31,6 +31,7 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
@@ -114,7 +115,9 @@ class NemoSTTService(WebsocketSTTService):
                 latency. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to parent WebsocketSTTService.
         """
+        settings = STTSettings(model="nemo-asr", language=None)
         super().__init__(
+            settings=settings,
             sample_rate=sample_rate,
             ttfs_p99_latency=ttfs_p99_latency,
             keepalive_timeout=30,
@@ -155,8 +158,6 @@ class NemoSTTService(WebsocketSTTService):
         # sample_rate: rate required by Nemo server (always 16000)
         self._input_sample_rate: Optional[int] = None
         self._resampler = None
-
-        self.set_model_name("nemo-asr")
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate processing metrics.
