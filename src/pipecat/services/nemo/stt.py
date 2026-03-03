@@ -12,6 +12,7 @@ a custom Nemo-based ASR server for real-time speech recognition.
 
 import base64
 import json
+import time
 from collections import deque
 from enum import IntEnum
 from typing import AsyncGenerator, Optional
@@ -131,6 +132,8 @@ class NemoSTTService(WebsocketSTTService):
         self._stream_started = False
         self._connecting = False
         self._waiting_for_final = False  # Track if we're waiting for final transcription
+        self._stream_start_time: Optional[float] = None  # For latency tracking
+        self._audio_bytes_sent = 0  # Track audio sent per stream
 
         # Audio buffering - match working client's ~320ms batches
         # The standalone Python client batches audio to reduce network overhead
@@ -285,6 +288,7 @@ class NemoSTTService(WebsocketSTTService):
             return
 
         try:
+            audio_bytes = len(self._audio_buffer)
             audio_base64 = base64.b64encode(bytes(self._audio_buffer)).decode("utf-8")
             message = {
                 "type": "audio",
@@ -293,9 +297,11 @@ class NemoSTTService(WebsocketSTTService):
                 "is_final": False,
             }
             await self._websocket.send(json.dumps(message))
+            self._audio_bytes_sent += audio_bytes
             self._audio_buffer.clear()
+            logger.trace(f"NemoSTT: Sent {audio_bytes} bytes of audio")
         except Exception as e:
-            logger.warning(f"Failed to send audio: {e}")
+            logger.warning(f"NemoSTT: Failed to send audio: {e}")
 
     async def _connect(self):
         """Connect to Nemo ASR and start receive task."""
@@ -326,8 +332,9 @@ class NemoSTTService(WebsocketSTTService):
             if self._websocket and self._websocket.state is State.OPEN:
                 return
 
-            logger.debug(f"Connecting to Nemo ASR at {self._url}")
+            logger.info(f"NemoSTT: Connecting to {self._url}")
             self._websocket = await websocket_connect(self._url)
+            logger.info("NemoSTT: Connected successfully")
 
             await self._call_event_handler("on_connected")
         except Exception as e:
@@ -367,13 +374,15 @@ class NemoSTTService(WebsocketSTTService):
             # This matches the working client which sends audio right after start_stream
             # The server can handle audio arriving before it sends stream_started confirmation
             self._stream_started = True
-            logger.debug("Sent start_stream to Nemo ASR")
+            self._stream_start_time = time.time()
+            self._audio_bytes_sent = 0
+            logger.info("NemoSTT: Stream started (user speaking)")
 
             # Send pre-speech audio immediately if we have enough
             if len(self._audio_buffer) >= self._target_buffer_bytes:
                 await self._send_buffered_audio()
         except Exception as e:
-            logger.warning(f"Failed to send start_stream: {e}")
+            logger.warning(f"NemoSTT: Failed to send start_stream: {e}")
 
     async def _end_stream(self):
         """End the current transcription stream to get final transcription."""
@@ -396,9 +405,17 @@ class NemoSTTService(WebsocketSTTService):
             end_message = {"type": "end_stream"}
             await self._websocket.send(json.dumps(end_message))
             self._waiting_for_final = True
-            logger.debug("Sent end_stream to Nemo ASR")
+            stream_duration = (
+                (time.time() - self._stream_start_time) * 1000
+                if self._stream_start_time
+                else 0
+            )
+            logger.info(
+                f"NemoSTT: Stream ended (user stopped speaking) - "
+                f"duration: {stream_duration:.0f}ms, audio sent: {self._audio_bytes_sent} bytes"
+            )
         except Exception as e:
-            logger.warning(f"Failed to send end_stream: {e}")
+            logger.warning(f"NemoSTT: Failed to send end_stream: {e}")
 
     async def _disconnect_websocket(self):
         """Close WebSocket connection."""
@@ -500,7 +517,15 @@ class NemoSTTService(WebsocketSTTService):
         if not text:
             return
 
+        # Calculate latency from stream start
+        latency_ms = (
+            (time.time() - self._stream_start_time) * 1000
+            if self._stream_start_time
+            else 0
+        )
+
         if is_partial:
+            logger.debug(f"NemoSTT: [interim] \"{text}\" (latency: {latency_ms:.0f}ms)")
             await self.push_frame(
                 InterimTranscriptionFrame(
                     text,
@@ -511,6 +536,7 @@ class NemoSTTService(WebsocketSTTService):
                 )
             )
         else:
+            logger.info(f"NemoSTT: [final] \"{text}\" (latency: {latency_ms:.0f}ms)")
             await self.push_frame(
                 TranscriptionFrame(
                     text,
